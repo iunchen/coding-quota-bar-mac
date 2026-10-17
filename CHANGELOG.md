@@ -2,7 +2,7 @@
 ## [1.9.0] - 2026-10-15
 ### Added
 - macOS 平台支持：新增 dmg/zip（arm64/x64）打包目标与 `package:mac` 脚本
-- 托盘图标在 macOS 按 Retina 2x 渲染，菜单栏数字与加载动画不再模糊
+- macOS 托盘数字改用系统字体矢量渲染（离屏窗口 + SF Pro），替换 5×7 点阵字模；字高铺满图标、随显示器缩放因子自适应，Windows 维持原渲染
 - GitHub Actions 新增 macOS 构建任务，随 tag 一并发布
 
 ### Changed
