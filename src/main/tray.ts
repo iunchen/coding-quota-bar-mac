@@ -1,4 +1,4 @@
-import { Tray, Menu, nativeImage, MenuItem } from 'electron';
+import { Tray, Menu, nativeImage, MenuItem, screen } from 'electron';
 import * as zlib from 'node:zlib';
 import { t } from './i18n';
 import { isStoreBuild } from './channel';
@@ -123,11 +123,81 @@ function encodePng(width: number, height: number, rgba: Buffer): Buffer {
 }
 
 /**
+ * macOS 托盘图标渲染参数
+ * 菜单栏高度是固定逻辑值（与 4K/2K/HD 分辨率无关），因此"自适应"的正确做法是：
+ * 逻辑尺寸恒定 16pt + 物理像素按显示器缩放因子 × 2 超采样。
+ * 这样任意分辨率/缩放组合下图标视觉大小一致且锐利。
+ */
+function trayRenderConfig(): { physical: number; sf: number } {
+  let displayScale = 1;
+  try {
+    // screen 仅可在 app ready 后使用；托盘创建于 ready 之后，异常时回退 2x
+    displayScale = Math.max(1, screen.getPrimaryDisplay().scaleFactor);
+  } catch {
+    displayScale = 2;
+  }
+  const sf = Math.max(2, Math.round(displayScale * 2));
+  return { physical: 16 * sf, sf };
+}
+
+/**
  * 创建包含数字的托盘图标 (PNG 格式)
  * 使用位图字体渲染百分比数字，生成 PNG 供 Electron NativeImage 使用
+ *
+ * - Windows：保持原有 16×16 居中渲染不变
+ * - macOS：数字铺满图标高度（约为旧版的 2 倍大），物理像素按显示器缩放超采样
  */
 export function createTrayIcon(percent: number, color: DisplayColor): Electron.NativeImage {
-  const size = 16;
+  if (process.platform !== 'darwin') {
+    const size = 16;
+    const colorHex = COLORS[color];
+
+    // 解析颜色
+    const r = parseInt(colorHex.slice(1, 3), 16);
+    const g = parseInt(colorHex.slice(3, 5), 16);
+    const b = parseInt(colorHex.slice(5, 7), 16);
+
+    // 初始化透明像素缓冲
+    const pixels = Buffer.alloc(size * size * 4, 0);
+
+    // 渲染文本（位图字体 5x7）
+    const noData = percent < 0;
+    const text = noData ? '--' : String(Math.round(percent));
+    const charWidth = 5;
+    const charHeight = 7;
+    const charGap = text.length > 2 ? 0 : 1;
+    const textWidth = text.length * charWidth + (text.length - 1) * charGap;
+    const offsetX = Math.floor((size - textWidth) / 2);
+    const offsetY = Math.floor((size - charHeight) / 2);
+
+    for (let ci = 0; ci < text.length; ci++) {
+      const glyph = DIGIT_FONT[text[ci]];
+      if (!glyph) continue;
+      const cx = offsetX + ci * (charWidth + charGap);
+      for (let row = 0; row < glyph.length; row++) {
+        for (let col = 0; col < glyph[row].length; col++) {
+          if (glyph[row][col] === '1') {
+            const px = cx + col;
+            const py = offsetY + row;
+            if (px >= 0 && px < size && py >= 0 && py < size) {
+              const idx = (py * size + px) * 4;
+              pixels[idx] = r;
+              pixels[idx + 1] = g;
+              pixels[idx + 2] = b;
+              pixels[idx + 3] = 255;
+            }
+          }
+        }
+      }
+    }
+
+    const pngBuffer = encodePng(size, size, pixels);
+    return nativeImage.createFromBuffer(pngBuffer);
+  }
+
+  // —— macOS：数字铺满图标高度 ——
+  const { physical, sf } = trayRenderConfig();
+  const u = Math.max(1, Math.floor(physical / 8)); // 字体基本单元：字高占图标 7/8
   const colorHex = COLORS[color];
 
   // 解析颜色
@@ -135,18 +205,18 @@ export function createTrayIcon(percent: number, color: DisplayColor): Electron.N
   const g = parseInt(colorHex.slice(3, 5), 16);
   const b = parseInt(colorHex.slice(5, 7), 16);
 
-  // 初始化透明像素缓冲
-  const pixels = Buffer.alloc(size * size * 4, 0);
-
-  // 渲染文本（位图字体 5x7）
   const noData = percent < 0;
   const text = noData ? '--' : String(Math.round(percent));
-  const charWidth = 5;
-  const charHeight = 7;
-  const charGap = text.length > 2 ? 0 : 1;
+  const charWidth = 5 * u;
+  const charHeight = 7 * u;
+  const charGap = (text.length > 2 ? 0 : 1) * u;
   const textWidth = text.length * charWidth + (text.length - 1) * charGap;
-  const offsetX = Math.floor((size - textWidth) / 2);
-  const offsetY = Math.floor((size - charHeight) / 2);
+  const width = textWidth + 2 * u; // 左右各留 1u 边距
+  const height = charHeight + 2 * u; // 上下各留 1u 边距
+  const offsetX = u;
+  const offsetY = Math.floor((height - charHeight) / 2);
+
+  const pixels = Buffer.alloc(width * height * 4, 0);
 
   for (let ci = 0; ci < text.length; ci++) {
     const glyph = DIGIT_FONT[text[ci]];
@@ -155,22 +225,27 @@ export function createTrayIcon(percent: number, color: DisplayColor): Electron.N
     for (let row = 0; row < glyph.length; row++) {
       for (let col = 0; col < glyph[row].length; col++) {
         if (glyph[row][col] === '1') {
-          const px = cx + col;
-          const py = offsetY + row;
-          if (px >= 0 && px < size && py >= 0 && py < size) {
-            const idx = (py * size + px) * 4;
-            pixels[idx] = r;
-            pixels[idx + 1] = g;
-            pixels[idx + 2] = b;
-            pixels[idx + 3] = 255;
+          // 单元格按 u×u 实心放大
+          for (let dy = 0; dy < u; dy++) {
+            for (let dx = 0; dx < u; dx++) {
+              const px = cx + col * u + dx;
+              const py = offsetY + row * u + dy;
+              if (px >= 0 && px < width && py >= 0 && py < height) {
+                const idx = (py * width + px) * 4;
+                pixels[idx] = r;
+                pixels[idx + 1] = g;
+                pixels[idx + 2] = b;
+                pixels[idx + 3] = 255;
+              }
+            }
           }
         }
       }
     }
   }
 
-  const pngBuffer = encodePng(size, size, pixels);
-  return nativeImage.createFromBuffer(pngBuffer);
+  const pngBuffer = encodePng(width, height, pixels);
+  return nativeImage.createFromBuffer(pngBuffer, { scaleFactor: sf });
 }
 
 /**
@@ -183,10 +258,14 @@ const LOADING_INTERVAL = 180; // ms
  * 创建加载动画的一帧（旋转弧线）
  */
 export function createLoadingFrame(frameIndex: number): Electron.NativeImage {
-  const size = 16;
-  const cx = 7.5;
-  const cy = 7.5;
-  const radius = 5;
+  // Windows 保持原有 16×16；macOS 按显示器缩放超采样（逻辑 16pt 恒定）
+  const { physical, sf } =
+    process.platform === 'darwin' ? trayRenderConfig() : { physical: 16, sf: 1 };
+  const size = physical;
+  const k = size / 16; // 相对原 16px 设计稿的缩放系数
+  const cx = 7.5 * k;
+  const cy = 7.5 * k;
+  const radius = 5 * k;
 
   const pixels = Buffer.alloc(size * size * 4, 0);
 
@@ -197,9 +276,13 @@ export function createLoadingFrame(frameIndex: number): Electron.NativeImage {
   // 灰蓝色弧线
   const cr = 140, cg = 160, cb = 190;
 
-  // 绘制弧线（两层半径让线条更粗一些）
-  for (const r of [radius, radius - 1]) {
-    for (let a = startAngle; a < startAngle + Math.PI * 2 - gapAngle; a += 0.08) {
+  // 绘制弧线（macOS 线宽随物理尺寸缩放；Windows 保持原有两环）
+  const rings =
+    process.platform === 'darwin'
+      ? [radius, radius - k, radius - 2 * k]
+      : [radius, radius - 1];
+  for (const r of rings) {
+    for (let a = startAngle; a < startAngle + Math.PI * 2 - gapAngle; a += 0.08 / k) {
       const x = Math.round(cx + r * Math.cos(a));
       const y = Math.round(cy + r * Math.sin(a));
       if (x >= 0 && x < size && y >= 0 && y < size) {
@@ -213,7 +296,7 @@ export function createLoadingFrame(frameIndex: number): Electron.NativeImage {
   }
 
   const pngBuffer = encodePng(size, size, pixels);
-  return nativeImage.createFromBuffer(pngBuffer);
+  return nativeImage.createFromBuffer(pngBuffer, { scaleFactor: sf });
 }
 
 /**
